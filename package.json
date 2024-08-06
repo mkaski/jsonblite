@@ -1,0 +1,41 @@
+{
+  "name": "jsonblite",
+  "description": "JSONBLite is a single file, key-value binary JSON database, written as TypeScript class for Node.js. A simple, persistent JSON/CBOR storage.",
+  "version": "0.0.1",
+  "main": "dist/src/jsonblite.js",
+  "types": "dist/src/jsonblite.d.ts",
+  "type": "module",
+  "scripts": {
+    "build": "tsc",
+    "test": "tsc && node dist/test/jsonblite.test.js && node dist/test/acid.test.js",
+    "benchmark": "tsc && node dist/test/benchmark.test.js"
+  },
+  "dependencies": {
+    "cbor-x": "^1.6.0",
+    "fs-ext": "^2.0.0"
+  },
+  "devDependencies": {
+    "@types/fs-ext": "^2.0.3",
+    "@types/node": "^20.14.10",
+    "typescript": "^5.5.3"
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "src"
+  ],
+  "author": "Matias Kaskimies",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git@github.com:mkaski/jsonblite.git"
+  },
+  "keywords": [
+    "json",
+    "cbor",
+    "binary",
+    "database",
+    "key-value",
+    "single-file"
+  ]
+}

@@ -1,0 +1,5 @@
+node_modules/
+dist/
+
+example.json
+example.jsonblite
