@@ -28,7 +28,7 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "git@github.com:mkaski/jsonblite.git"
+    "url": "git+ssh://git@github.com/mkaski/jsonblite.git"
   },
   "keywords": [
     "json",
