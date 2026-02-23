@@ -1,7 +1,7 @@
 {
   "name": "jsonblite",
   "description": "JSONBLite is a single file, key-value binary JSON database, written as TypeScript class for Node.js. A simple, persistent JSON/CBOR storage.",
-  "version": "0.0.1",
+  "version": "0.0.2",
   "main": "dist/src/jsonblite.js",
   "types": "dist/src/jsonblite.d.ts",
   "type": "module",
