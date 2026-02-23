@@ -2,7 +2,7 @@ import fs from 'fs';
 import assert from 'assert';
 import Jsonblite from '../src/jsonblite.js';
 
-const DB_FILE = './acid.jsonblite';
+const DB_FILE = './data/acid.jsonblite';
 
 async function atomicity() {
     const db = new Jsonblite(DB_FILE);

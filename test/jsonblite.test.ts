@@ -1,6 +1,6 @@
 import JSONBLite from '../src/jsonblite.js';
 
-const path = './example.jsonblite';
+const path = './data/example.jsonblite';
 
 // Create new db.
 const db = new JSONBLite(path, { verbose: true });
@@ -37,4 +37,4 @@ db2.delete('key10');
 db2.vacuum();
 
 // Dump db.
-db2.dump('./example.json');
+db2.dump('./data/example.json');

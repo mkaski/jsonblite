@@ -38,7 +38,7 @@ Use the class in your Node.js application
 import JSONBLite from 'jsonblite';
 
 // initialize JSONBlite instance by reading or creating a database file
-const db = new JSONBLite('./db.jsonblite');
+const db = new JSONBLite('./data/db.jsonblite');
 
 db.write('k', { value: 'Hello, world!', number: 1 });
 db.write('k2', 123);
