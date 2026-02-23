@@ -54,6 +54,27 @@ function atomicity() {
     const recovered = new Jsonblite(DB_FILE);
     assert.deepStrictEqual(recovered.read('stable'), { value: 1 }, 'Recovery should preserve committed data');
     assert.strictEqual(fs.existsSync(JOURNAL_FILE), false, 'Recovery should clear journal');
+
+    // Empty journal can happen if process exits between file truncate and write.
+    fs.writeFileSync(JOURNAL_FILE, Buffer.alloc(0));
+    const recoveredFromEmptyJournal = new Jsonblite(DB_FILE);
+    assert.deepStrictEqual(
+        recoveredFromEmptyJournal.read('stable'),
+        { value: 1 },
+        'Recovery should ignore empty journal and preserve committed data',
+    );
+    assert.strictEqual(fs.existsSync(JOURNAL_FILE), false, 'Recovery should clear empty journal');
+
+    // Truncated journal should also be discarded without crashing startup.
+    const truncatedJournal = Buffer.from(encode(replayTransaction).subarray(0, 8));
+    fs.writeFileSync(JOURNAL_FILE, truncatedJournal);
+    const recoveredFromTruncatedJournal = new Jsonblite(DB_FILE);
+    assert.deepStrictEqual(
+        recoveredFromTruncatedJournal.read('stable'),
+        { value: 1 },
+        'Recovery should ignore truncated journal and preserve committed data',
+    );
+    assert.strictEqual(fs.existsSync(JOURNAL_FILE), false, 'Recovery should clear truncated journal');
 }
 
 function consistency() {

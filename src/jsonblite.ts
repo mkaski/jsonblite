@@ -141,10 +141,46 @@ export default class JSONBLite {
         }
     }
 
+    private handleInvalidJournal(journalPath: string, reason: string) {
+        this.log(`${LOG_ERROR_PREFIX} Ignoring invalid journal (${reason})`);
+        if (fs.existsSync(journalPath)) {
+            fs.unlinkSync(journalPath);
+        }
+    }
+
     private recoverWithFileDescriptor(fd: number, journalPath: string) {
         this.log(`${LOG_INFO_PREFIX} RECOVERING FROM JOURNAL`);
         const journalBuffer = fs.readFileSync(journalPath);
-        const transaction: Transaction = decode(journalBuffer);
+        if (journalBuffer.length === 0) {
+            this.handleInvalidJournal(journalPath, 'empty');
+            return;
+        }
+
+        let transaction: Transaction;
+        try {
+            transaction = decode(journalBuffer) as Transaction;
+        } catch (err: any) {
+            this.handleInvalidJournal(journalPath, err.message ?? 'decode failure');
+            return;
+        }
+
+        if (!transaction || typeof transaction !== 'object') {
+            this.handleInvalidJournal(journalPath, 'invalid transaction payload');
+            return;
+        }
+        if (transaction.operation !== 'write' && transaction.operation !== 'delete') {
+            this.handleInvalidJournal(journalPath, 'invalid operation');
+            return;
+        }
+        if (!Buffer.isBuffer(transaction.header) || !Buffer.isBuffer(transaction.index) || !Number.isInteger(transaction.dataOffset)) {
+            this.handleInvalidJournal(journalPath, 'invalid transaction structure');
+            return;
+        }
+        if (transaction.operation === 'write' && !Buffer.isBuffer(transaction.data)) {
+            this.handleInvalidJournal(journalPath, 'missing write data');
+            return;
+        }
+
         this.performTransaction(transaction, fd);
         this.commitTransaction();
     }
