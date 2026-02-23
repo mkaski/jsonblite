@@ -1,6 +1,6 @@
 # JSONBLite: Single-file binary JSON database
 
-JSONBLite is a single file, key-value binary JSON database, implemented as a TypeScript class for Node.js. A naive solution for persistent JSON storage, embeddable in Node.js applications. Operations are synchronous and it tries to be ACID-compliant, using file locks and journaling.
+JSONBLite is a single file, key-value binary JSON database, implemented as a TypeScript class for Node.js. A naive solution for persistent JSON storage, embeddable in Node.js applications. Operations are synchronous, and writes are serialized with file locks plus a write-ahead journal.
 
 JSONBLite uses [CBOR](https://cbor.io) (Concise Binary Object Representation) standard to store binary JSON data. It's more compact and faster to parse than JSON. Any JSON data can be encoded/decoded in the database.
 
@@ -15,7 +15,7 @@ See [jsonblite-example](https://github.com/mkaski/jsonblite-example) for LIVE DE
 - Single file database
 - Single TypeScript class in less than 500 lines of code
 - CBOR for binary JSON storage
-- ACID based on file locks and journaling
+- File locks and journaling for crash recovery
 - In-memory `Map` index
 - Append-only log, with a manual `vacuum()` garbage collection
 
@@ -44,8 +44,9 @@ db.write('k', { value: 'Hello, world!', number: 1 });
 db.write('k2', 123);
 db.read('k');
 // -> { value: 'Hello, world!', number: 1 }
-db.dump();
-// -> { "meta": { "version": 1, "index_size": 10, "last_vacuum": 0 }, "data": { "k": { "value": "Hello, world!", "number": 1 }, "k2": 123 } }
+const dumpStream = db.dump();
+dumpStream.pipe(process.stdout);
+db.dump('./data/db.json');
 db.delete('k2');
 db.read('k');
 // -> null
@@ -69,7 +70,8 @@ db.keys();
 ## Maintenance
 
 - `vacuum()`: Run to permanently remove deleted data from the database file, and compact the file.
-- `dump(filename?: string)`: Dump the database to a JSON file.
+- `dump()`: Return a readable stream with a consistent JSON snapshot.
+- `dump(filename: string)`: Write a consistent JSON snapshot to a file.
 
 # File Format
 
@@ -112,7 +114,7 @@ Data is saved as a log of [CBOR](https://cbor.io)-encoded JSON records. Data is 
 
 # Dump
 
-Dumped JSONBLite database is a JSON object with `meta` and `data` fields.
+`dump()` produces JSON with `meta` and `data` fields. The same payload is streamed to the caller or written to a file when a filename is provided.
 
 ```json
 {

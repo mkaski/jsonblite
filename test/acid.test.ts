@@ -1,119 +1,125 @@
 import fs from 'fs';
 import assert from 'assert';
+import { encode } from 'cbor-x';
 import Jsonblite from '../src/jsonblite.ts';
+import {
+    HEADER_DATA_SIZE_BYTES,
+    HEADER_SIZE,
+    LOCATION_DATA_SIZE,
+    LOCATION_INDEX_SIZE,
+} from '../src/constants.ts';
 
 const DB_FILE = './data/acid.jsonblite';
+const JOURNAL_FILE = `${DB_FILE}.journal`;
+const TEMP_FILE = `${DB_FILE}.temp`;
 
-async function atomicity() {
+function cleanupFiles() {
+    if (fs.existsSync(DB_FILE)) {
+        fs.unlinkSync(DB_FILE);
+    }
+    if (fs.existsSync(JOURNAL_FILE)) {
+        fs.unlinkSync(JOURNAL_FILE);
+    }
+    if (fs.existsSync(TEMP_FILE)) {
+        fs.unlinkSync(TEMP_FILE);
+    }
+}
+
+function atomicity() {
     const db = new Jsonblite(DB_FILE);
-    // TODO: Test journaling and recovery in case of crash
+    db.write('stable', { value: 1 });
+
+    // Build a valid "in-flight" transaction journal and verify constructor recovery.
+    const fd = fs.openSync(DB_FILE, 'r');
+    const header = Buffer.alloc(HEADER_SIZE);
+    fs.readSync(fd, header, 0, HEADER_SIZE, 0);
+    const dataSize = header.readUIntLE(LOCATION_DATA_SIZE, HEADER_DATA_SIZE_BYTES);
+    const indexSize = header.readUInt32LE(LOCATION_INDEX_SIZE);
+    const dataOffset = HEADER_SIZE + dataSize;
+    const index = Buffer.alloc(indexSize);
+    fs.readSync(fd, index, 0, indexSize, dataOffset);
+    fs.closeSync(fd);
+
+    const replayTransaction = {
+        key: 'noop',
+        operation: 'delete',
+        data: null,
+        index,
+        header,
+        dataOffset,
+    };
+    fs.writeFileSync(JOURNAL_FILE, encode(replayTransaction));
+    assert.strictEqual(fs.existsSync(JOURNAL_FILE), true, 'Journal fixture should exist');
+
+    const recovered = new Jsonblite(DB_FILE);
+    assert.deepStrictEqual(recovered.read('stable'), { value: 1 }, 'Recovery should preserve committed data');
+    assert.strictEqual(fs.existsSync(JOURNAL_FILE), false, 'Recovery should clear journal');
 }
 
 function consistency() {
     const db = new Jsonblite(DB_FILE);
     assert.throws(() => db.write('', { value: 1 }), 'Invalid key should throw error');
+    assert.throws(() => db.read(''), 'Invalid key should throw error');
+    assert.throws(() => db.delete(''), 'Invalid key should throw error');
+
     db.write('key1', { value: 1 });
     assert.deepStrictEqual(db.read('key1'), { value: 1 }, 'Read value should match written value');
 }
 
-async function isolation() {
-    // Create database instances of the same db file.
+function isolation() {
     const db1 = new Jsonblite(DB_FILE);
     const db2 = new Jsonblite(DB_FILE);
     const db3 = new Jsonblite(DB_FILE);
     const db4 = new Jsonblite(DB_FILE);
+    const dbs = [db1, db2, db3, db4];
 
-    // Create 100 database instances of the same db file.
-    const dbs = Array.from({ length: 100 }, () => new Jsonblite(DB_FILE, { verbose: false }));
-
-    // Collect all write promises
-    const writePromises = dbs.map(async (db) => {
-        const writeKey = Math.random().toString(36).substring(7);
-        db.write(writeKey, { value: 1 });
-    });
-
-    // Wait for all writes to complete
-    await Promise.all(writePromises);
-
-    // Check that all databases have the same keys
-    for (const db of dbs) {
-        assert.deepStrictEqual(db.keys(), dbs[0].keys(), 'All databases should have the same keys');
+    for (let i = 0; i < 200; i++) {
+        dbs[i % dbs.length].write(`k${i}`, { value: i });
     }
 
+    const expectedKeys = db1.keys().sort();
+    for (const db of dbs) {
+        assert.deepStrictEqual(db.keys().sort(), expectedKeys, 'All instances should observe the same keys');
+    }
 
-    // Write to each database instance concurrently.
-    await Promise.all([
-        db1.write('key1', { value: 1 }),
-        db1.write('key2', { value: 222 }),
-        db1.write('key2', { value: 222 }),
-        db2.write('key2', { value: 2 }),
-        db3.write('key3', { value: 3 }),
-        db4.write('key4', { value: 4 }),
-    ]);
+    for (let i = 0; i < 200; i++) {
+        const key = `k${i}`;
+        assert.deepStrictEqual(db2.read(key), { value: i }, `Value mismatch for key ${key}`);
+        assert.deepStrictEqual(db3.read(key), { value: i }, `Value mismatch for key ${key}`);
+    }
 
-    console.log('db1', db1.keys());
-    console.log('db2', db2.keys());
-    console.log('db3', db3.keys());
-    console.log('db4', db4.keys());
+    db1.write('shared', { value: 1 });
+    db2.write('shared', { value: 2 });
+    assert.deepStrictEqual(db3.read('shared'), { value: 2 }, 'Latest write should be visible across instances');
 
-    // All databases should have the same keys and values.
-    assert.deepStrictEqual(db1.keys(), db2.keys(), 'All databases should have the same keys');
-    assert.deepStrictEqual(db1.keys(), db3.keys(), 'All databases should have the same keys');
-    assert.deepStrictEqual(db2.keys(), db3.keys(), 'All databases should have the same keys');
-    assert.deepStrictEqual(db1.keys(), db4.keys(), 'All databases should have the same keys');
+    db4.delete('shared');
+    assert.strictEqual(db1.read('shared'), null, 'Delete should be visible across instances');
+    assert.strictEqual(db2.read('shared'), null, 'Delete should be visible across instances');
 
-    assert.deepStrictEqual(db1.read('key1'), { value: 1 }, 'DB1 should read its own written value');
-    assert.deepStrictEqual(db1.read('key2'), { value: 2 }, 'DB2 should read its own written value');
-    assert.deepStrictEqual(db1.read('key3'), { value: 3 }, 'DB3 should read its own written value');
-    assert.deepStrictEqual(db1.read('key4'), { value: 4 }, 'DB4 should read its own written value');
-
-    db1.delete('key1');
-    db2.delete('key2');
-    db3.delete('key3');
-
-    console.log('db1', db1.keys());
-    console.log('db2', db2.keys());
-    console.log('db3', db3.keys());
-
-    // TODO: This is not consistent. There is some race condition in the lock mechanism.
-    await Promise.all([
-        db1.delete('key1'),
-        db2.write('key2', { value: 22 }),
-        db3.write('key3', { value: 33 }),
-        db4.delete('key4'),
-    ]);
-
-    assert.strictEqual(db1.read('key1'), null, 'Key1 should be deleted');
-    assert.deepStrictEqual(db2.read('key3'), { value: 33 }, 'DB2 should read DB3 written value');
-    assert.deepStrictEqual(db3.read('key2'), { value: 22 }, 'DB3 should read DB2 written value');
-    assert.deepStrictEqual(db4.read('key4'), null, 'Key4 should be deleted');
+    db2.delete('k10');
+    assert.strictEqual(db3.read('k10'), null, 'Delete should remove key for all instances');
 }
 
 function durability() {
     let db: Jsonblite | null = new Jsonblite(DB_FILE);
-    db.write('key1', { value: 1 });
-    db = null; // Close the database
+    db.write('durable', { value: 1 });
+    db = null;
 
-    // Re-initialize from file
     const db2 = new Jsonblite(DB_FILE);
-    assert.deepStrictEqual(db2.read('key1'), { value: 1 }, 'Data should persist after restart');
+    assert.deepStrictEqual(db2.read('durable'), { value: 1 }, 'Data should persist after restart');
 }
 
-// Run all tests
 async function test() {
-    // Cleanup
-    if (fs.existsSync(DB_FILE)) {
-        fs.unlinkSync(DB_FILE);
-    }
+    cleanupFiles();
 
     console.log('Testing Atomicity...');
-    await atomicity();
+    atomicity();
 
     console.log('Testing Consistency...');
     consistency();
 
     console.log('Testing Isolation...');
-    await isolation();
+    isolation();
 
     console.log('Testing Durability...');
     durability();
@@ -126,10 +132,8 @@ test()
     .catch(err => {
         console.trace(err);
         console.error('❌ An error occurred during tests:', err.message);
+        process.exitCode = 1;
     })
     .finally(() => {
-        // Cleanup
-        if (fs.existsSync(DB_FILE)) {
-            fs.unlinkSync(DB_FILE);
-        }
+        cleanupFiles();
     });
