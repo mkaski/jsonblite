@@ -5,10 +5,9 @@ import { PassThrough } from 'stream';
 
 import {
     DEFAULT_FILE_CONTENT,
-    DEFAULT_HEADER,
     DEFAULT_OPTIONS,
     ERROR_INVALID_KEY,
-    HEADER_LAST_MODIFIED_SIZE_BYTES,
+    HEADER_DATA_SIZE_BYTES,
     HEADER_SIZE,
     LOCATION_DATA_SIZE,
     LOCATION_INDEX_SIZE,
@@ -18,6 +17,7 @@ import {
     LOG_ERROR_PREFIX,
     LOG_INFO_PREFIX,
     LOG_PREFIX,
+    createDefaultHeader,
 } from './constants.ts';
 
 interface Options {
@@ -26,41 +26,34 @@ interface Options {
 
 interface Transaction {
     key: string;
-    operation: string;
-    data: any;
+    operation: 'write' | 'delete';
+    data: Buffer | null;
     index: Buffer;
     header: Buffer;
     dataOffset: number;
 }
 
+type IndexMap = Map<string, [number, number]>;
+
 export default class JSONBLite {
     filename: string;
     header: Buffer; // Header bytes
-    index: Map<string, [number, number]>; // Key: [offset, size]
+    index: IndexMap; // Key: [offset, size]
     dataTail: number; // Offset to append new data
     options: Options;
-    lastModified: BigInt;
 
     constructor(filename: string, options?: Options) {
         this.filename = filename;
-        this.header = DEFAULT_HEADER;
+        this.header = createDefaultHeader();
         this.index = new Map();
-        this.dataTail = HEADER_SIZE + this.header.readUInt32LE(LOCATION_DATA_SIZE);
+        this.dataTail = HEADER_SIZE + this.readDataSizeFromHeader();
         this.options = { ...DEFAULT_OPTIONS, ...options };
-        this.lastModified = this.header.readBigInt64LE(LOCATION_LAST_MODIFIED);
 
         if (fs.existsSync(filename)) {
-            // Recover if a journal file exists. Before recovery, the file might be corrupted.
-            const journalExists = fs.existsSync(`${filename}.journal`);
-            if (journalExists) {
-                this.recover();
-            }
-            // Read the header and index from file, using a shared lock.
-            const fd = fs.openSync(filename, 'r');
-            this.sharedLock(fd);
+            const fd = fs.openSync(filename, 'r+');
+            this.lock(fd);
             try {
-                // Build the header and index from file.
-                this.buildHeaderAndIndex(fd);
+                this.sync(fd);
             } finally {
                 this.unlock(fd);
                 fs.closeSync(fd);
@@ -70,13 +63,20 @@ export default class JSONBLite {
         }
     }
 
+    private readDataSizeFromHeader() {
+        return this.header.readUIntLE(LOCATION_DATA_SIZE, HEADER_DATA_SIZE_BYTES);
+    }
+
+    private writeDataSizeToHeader(dataSize: number) {
+        this.header.writeUIntLE(dataSize, LOCATION_DATA_SIZE, HEADER_DATA_SIZE_BYTES);
+    }
+
     private initializeFile() {
-        // Write the default file content.
         const fd = fs.openSync(this.filename, 'w+');
         this.lock(fd);
         try {
             fs.writeSync(fd, DEFAULT_FILE_CONTENT, 0, DEFAULT_FILE_CONTENT.length, 0);
-            this.buildHeaderAndIndex(fd);
+            this.sync(fd);
         } finally {
             this.unlock(fd);
             fs.closeSync(fd);
@@ -84,20 +84,27 @@ export default class JSONBLite {
     }
 
     private buildHeaderAndIndex(fd: number) {
-        // Read header from file.
-        fs.readSync(fd, this.header, 0, HEADER_SIZE, 0);
-        // Read index and data size from header.
-        const dataSize = this.header.readUInt32LE(LOCATION_DATA_SIZE);
-        const indexSize = this.header.readUInt32LE(LOCATION_INDEX_SIZE);
+        const nextHeader = Buffer.alloc(HEADER_SIZE);
+        fs.readSync(fd, nextHeader, 0, HEADER_SIZE, 0);
+
+        const dataSize = nextHeader.readUIntLE(LOCATION_DATA_SIZE, HEADER_DATA_SIZE_BYTES);
+        const indexSize = nextHeader.readUInt32LE(LOCATION_INDEX_SIZE);
         const indexLocation = HEADER_SIZE + dataSize;
-        // Read index from file.
+        const fileSize = fs.fstatSync(fd).size;
+        if (indexLocation + indexSize > fileSize) {
+            throw new Error(`${LOG_PREFIX} File is truncated or corrupted`);
+        }
+
         const indexBytes = Buffer.alloc(indexSize);
         fs.readSync(fd, indexBytes, 0, indexSize, indexLocation);
-        // const indexMap = decode(indexBytes); // Decode CBOR directly to Map.
-        // Update in-memory state.
-        this.index = decode(indexBytes); // Decode CBOR directly to Map.
+        const decodedIndex = decode(indexBytes);
+        if (!(decodedIndex instanceof Map)) {
+            throw new Error(`${LOG_PREFIX} Invalid index format`);
+        }
+
+        this.header = nextHeader;
+        this.index = decodedIndex as IndexMap;
         this.dataTail = indexLocation;
-        this.lastModified = this.header.readBigInt64LE(LOCATION_LAST_MODIFIED);
     }
 
     private validateKey(key: string) {
@@ -123,32 +130,24 @@ export default class JSONBLite {
         }
     }
 
-    private sharedLock(fd: number) {
-        try {
-            flockSync(fd, 'sh');
-        } catch (err: any) {
-            throw new Error(`Failed to acquire shared lock: ${err.message}`);
-        }
+    private recoverWithFileDescriptor(fd: number, journalPath: string) {
+        this.log(`${LOG_INFO_PREFIX} RECOVERING FROM JOURNAL`);
+        const journalBuffer = fs.readFileSync(journalPath);
+        const transaction: Transaction = decode(journalBuffer);
+        this.performTransaction(transaction, fd);
+        this.commitTransaction();
     }
 
     private sync(fd: number) {
-        // Check if journal file exists and recover if so.
-        const journalExists = fs.existsSync(`${this.filename}.journal`);
-        if (journalExists) {
-            this.recover();
+        const journalPath = `${this.filename}.journal`;
+        if (fs.existsSync(journalPath)) {
+            this.recoverWithFileDescriptor(fd, journalPath);
         }
-        // Check if last modified time has changed since last read.
-        // Rebuild header from the file if we recovered from journal OR last modified time has changed.
-        const lastModifiedOnFile = Buffer.alloc(HEADER_LAST_MODIFIED_SIZE_BYTES);
-        fs.readSync(fd, lastModifiedOnFile, 0, HEADER_LAST_MODIFIED_SIZE_BYTES, LOCATION_LAST_MODIFIED);
-        if (lastModifiedOnFile.readBigInt64LE() !== this.lastModified) {
-            this.buildHeaderAndIndex(fd);
-        }
+        this.buildHeaderAndIndex(fd);
     }
 
     private beginTransaction(transaction: Transaction) {
-        this.log(`${LOG_INFO_PREFIX} BEGIN TRANSACTION `, transaction);
-        // Write journal on every latest transaction.
+        this.log(`${LOG_INFO_PREFIX} BEGIN TRANSACTION`, transaction);
         const serialized = encode(transaction);
         fs.writeFileSync(`${this.filename}.journal`, serialized);
     }
@@ -156,44 +155,28 @@ export default class JSONBLite {
     private performTransaction(transaction: Transaction, fd: number) {
         switch (transaction.operation) {
             case 'write':
-                // Append new data to file.
+                if (!transaction.data) {
+                    throw new Error(`${LOG_PREFIX} Missing transaction data for write`);
+                }
                 fs.writeSync(fd, transaction.data, 0, transaction.data.length, transaction.dataOffset - transaction.data.length);
                 break;
             case 'delete':
-                // Updating the index and header is sufficient for a delete operation.
                 break;
             default:
                 throw new Error(`${LOG_PREFIX} Invalid operation`);
         }
 
-        // Common operations for all transactions.
-        // Write header to file
         fs.writeSync(fd, transaction.header, 0, HEADER_SIZE, 0);
-        // this.log(`${LOG_INFO_PREFIX} TX: Wrote header`);
-        // Append new index to end of file.
         const indexLocation = transaction.dataOffset;
         fs.writeSync(fd, transaction.index, 0, transaction.index.length, indexLocation);
-        // this.log(`${LOG_INFO_PREFIX} TX: Wrote index`);
+        fs.ftruncateSync(fd, indexLocation + transaction.index.length);
+        fs.fsyncSync(fd);
     }
 
     private commitTransaction() {
-        // Delete journal file on successful write.
-        fs.unlinkSync(`${this.filename}.journal`);
-    }
-
-    private recover() {
-        this.log(`${LOG_INFO_PREFIX} RECOVERING FROM JOURNAL`);
-        const fd = fs.openSync(this.filename, 'r+');
-        this.lock(fd);
-        try {
-            // Recover from a crash by replaying the journal transaction.
-            const journalBuffer = fs.readFileSync(`${this.filename}.journal`);
-            const transaction: Transaction = decode(journalBuffer);
-            this.performTransaction(transaction, fd);
-            this.commitTransaction();
-        } finally {
-            this.unlock(fd);
-            fs.closeSync(fd);
+        const journalPath = `${this.filename}.journal`;
+        if (fs.existsSync(journalPath)) {
+            fs.unlinkSync(journalPath);
         }
     }
 
@@ -208,17 +191,14 @@ export default class JSONBLite {
             throw new Error(`${LOG_PREFIX} ${ERROR_INVALID_KEY}`);
         }
 
-        const fd = fs.openSync(this.filename, 'r');
-        this.sharedLock(fd);
-
+        const fd = fs.openSync(this.filename, 'r+');
+        this.lock(fd);
         try {
             this.sync(fd);
-            // Search for the key in the index.
             const [offset, size] = this.index.get(key) ?? [null, null];
-            if (offset === null) {
+            if (offset === null || size === null) {
                 return null;
             }
-            // Read data from file.
             const readBuffer = Buffer.alloc(size);
             fs.readSync(fd, readBuffer, 0, size, offset);
             return decode(readBuffer);
@@ -233,34 +213,28 @@ export default class JSONBLite {
             throw new Error(`${LOG_PREFIX} ${ERROR_INVALID_KEY}`);
         }
 
-        // Lock the file.
         const fd = fs.openSync(this.filename, 'r+');
         this.lock(fd);
-
         try {
             this.sync(fd);
-            // Serialize value as CBOR.
             const serialized = encode(value);
-            // Update in-memory.
             this.index.set(key, [this.dataTail, serialized.length]);
             const indexBytes = encode(this.index);
             const indexSize = indexBytes.length;
             const lastModified = BigInt(Date.now());
-            this.lastModified = lastModified;
             this.dataTail += serialized.length;
             this.header.writeBigInt64LE(lastModified, LOCATION_LAST_MODIFIED);
             this.header.writeUInt32LE(indexSize, LOCATION_INDEX_SIZE);
-            this.header.writeUInt32LE(this.dataTail - HEADER_SIZE, LOCATION_DATA_SIZE);
-            // Build the uniform transaction payload to write to file.
+            this.writeDataSizeToHeader(this.dataTail - HEADER_SIZE);
+
             const transaction: Transaction = {
                 key,
                 operation: 'write',
-                header: this.header,
-                data: serialized,
-                index: indexBytes,
-                dataOffset: this.dataTail
-            }
-            // Begin, perform, and commit the transaction.
+                header: Buffer.from(this.header),
+                data: Buffer.from(serialized),
+                index: Buffer.from(indexBytes),
+                dataOffset: this.dataTail,
+            };
             this.beginTransaction(transaction);
             this.performTransaction(transaction, fd);
             this.commitTransaction();
@@ -275,32 +249,26 @@ export default class JSONBLite {
             throw new Error(`${LOG_PREFIX}${LOG_ERROR_PREFIX}${ERROR_INVALID_KEY}`);
         }
 
-        // Lock the file.
         const fd = fs.openSync(this.filename, 'r+');
         this.lock(fd);
-
         try {
-            // Sync the file to ensure the latest data.
             this.sync(fd);
-            // Delete key from index.
             this.index.delete(key);
-            // Update index in header.
             const indexBytes = encode(this.index);
             const indexSize = indexBytes.length;
             const lastModified = BigInt(Date.now());
-            this.lastModified = lastModified;
             this.header.writeUInt32LE(indexSize, LOCATION_INDEX_SIZE);
             this.header.writeBigInt64LE(lastModified, LOCATION_LAST_MODIFIED);
-            // Build the uniform transaction payload to write to file.
+            this.writeDataSizeToHeader(this.dataTail - HEADER_SIZE);
+
             const transaction: Transaction = {
                 key,
                 operation: 'delete',
-                header: this.header,
+                header: Buffer.from(this.header),
                 data: null,
-                index: indexBytes,
-                dataOffset: this.dataTail
-            }
-            // Begin, perform, and commit the transaction.
+                index: Buffer.from(indexBytes),
+                dataOffset: this.dataTail,
+            };
             this.beginTransaction(transaction);
             this.performTransaction(transaction, fd);
             this.commitTransaction();
@@ -313,106 +281,106 @@ export default class JSONBLite {
     dump(): PassThrough;
     dump(filename: string): void;
     dump(filename?: string): PassThrough | void {
-        const meta = {
-            version: this.header.readUInt8(LOCATION_VERSION),
-            data_size: this.header.readUInt32LE(LOCATION_DATA_SIZE),
-            index_size: this.header.readUInt32LE(LOCATION_INDEX_SIZE),
-            last_vacuum: this.header.readBigInt64LE(LOCATION_LAST_VACUUM_TIMESTAMP).toString(), // BigInt to string. JSON: "Do not know how to serialize a BigInt".
-        };
-        // Stream JSON dump to a file or return a PassThrough stream to caller.
-        const stream = filename ? fs.createWriteStream(filename) : new PassThrough();
-        stream.write('{\n');
-        stream.write(`  "meta": ${JSON.stringify(meta, null, 2)},\n`);
-        stream.write('  "data": {\n');
-        const entries = Array.from(this.index.entries());
-        entries.forEach(([key, [offset, size]], index) => {
-            const buffer = Buffer.alloc(size);
-            const fd = fs.openSync(this.filename, 'r');
-            fs.readSync(fd, buffer, 0, size, offset);
-            fs.closeSync(fd);
-            const value = decode(buffer);
-            const keyValueString = `    "${key}": ${JSON.stringify(value, null, 2)}`;
-            if (index < entries.length - 1) {
-                stream.write(`${keyValueString},\n`);
-            } else {
-                stream.write(`${keyValueString}\n`);
-            }
-        });
-        stream.write('  }\n');
-        stream.write('}\n');
-        stream.end();
+        const fd = fs.openSync(this.filename, 'r+');
+        this.lock(fd);
 
-        if (!filename) {
-            return stream as PassThrough;
+        try {
+            this.sync(fd);
+            const meta = {
+                version: this.header.readUInt8(LOCATION_VERSION),
+                data_size: this.header.readUIntLE(LOCATION_DATA_SIZE, HEADER_DATA_SIZE_BYTES),
+                index_size: this.header.readUInt32LE(LOCATION_INDEX_SIZE),
+                last_vacuum: this.header.readBigInt64LE(LOCATION_LAST_VACUUM_TIMESTAMP).toString(),
+            };
+            const data: Record<string, unknown> = {};
+            for (const [key, [offset, size]] of this.index.entries()) {
+                const buffer = Buffer.alloc(size);
+                fs.readSync(fd, buffer, 0, size, offset);
+                data[key] = decode(buffer);
+            }
+
+            const payload = `${JSON.stringify({ meta, data }, null, 2)}\n`;
+            if (filename) {
+                fs.writeFileSync(filename, payload);
+                return;
+            }
+
+            const stream = new PassThrough();
+            stream.end(payload);
+            return stream;
+        } finally {
+            this.unlock(fd);
+            fs.closeSync(fd);
         }
     }
 
-
     keys() {
-        const fd = fs.openSync(this.filename, 'r');
-        this.sharedLock(fd);
+        const fd = fs.openSync(this.filename, 'r+');
+        this.lock(fd);
         try {
             this.sync(fd);
-            // Return the keys from the index.
             return Array.from(this.index.keys());
         } finally {
-            // Ensure the file is unlocked and closed even if an error occurs.
             this.unlock(fd);
             fs.closeSync(fd);
         }
     }
 
     vacuum() {
-        // Temporary file for the new vacuumed database
         const tempFilename = `${this.filename}.temp`;
-        const tempFd = fs.openSync(tempFilename, 'w');
+        let tempFd: number | null = null;
 
-        // Acquire exclusive lock on the db
         const fd = fs.openSync(this.filename, 'r+');
         this.lock(fd);
 
         try {
             this.sync(fd);
-            const newHeader = DEFAULT_HEADER;
+            tempFd = fs.openSync(tempFilename, 'w');
+
+            const newHeader = createDefaultHeader();
             fs.writeSync(tempFd, newHeader, 0, HEADER_SIZE, 0);
 
             const newIndex = new Map<string, [number, number]>();
             let newDataOffset = HEADER_SIZE;
-            for (const [key, [offset, size]] of this.index) {
-                // Read the data from the old file. TODO: Maybe stream this?
+            for (const [key, [offset, size]] of this.index.entries()) {
                 const dataBuffer = Buffer.alloc(size);
                 fs.readSync(fd, dataBuffer, 0, size, offset);
                 fs.writeSync(tempFd, dataBuffer, 0, size, newDataOffset);
-                // Update the new index with the new offset
                 newIndex.set(key, [newDataOffset, size]);
-                // Update the new data offset
                 newDataOffset += size;
             }
+
             const indexBytes = encode(newIndex);
             const indexSize = indexBytes.length;
-
-            // Write the updated header and index to the temporary file
+            const now = BigInt(Date.now());
             newHeader.writeUInt32LE(indexSize, LOCATION_INDEX_SIZE);
-            newHeader.writeUInt32LE(newDataOffset - HEADER_SIZE, LOCATION_DATA_SIZE);
-            newHeader.writeBigInt64LE(BigInt(Date.now()), LOCATION_LAST_VACUUM_TIMESTAMP);
+            newHeader.writeUIntLE(newDataOffset - HEADER_SIZE, LOCATION_DATA_SIZE, HEADER_DATA_SIZE_BYTES);
+            newHeader.writeBigInt64LE(now, LOCATION_LAST_MODIFIED);
+            newHeader.writeBigInt64LE(now, LOCATION_LAST_VACUUM_TIMESTAMP);
+
             fs.writeSync(tempFd, newHeader, 0, HEADER_SIZE, 0);
             fs.writeSync(tempFd, indexBytes, 0, indexSize, newDataOffset);
+            fs.ftruncateSync(tempFd, newDataOffset + indexSize);
+            fs.fsyncSync(tempFd);
             fs.closeSync(tempFd);
+            tempFd = null;
 
-            // Log size difference
-            const oldSize = fs.statSync(this.filename).size;
+            const oldSize = fs.fstatSync(fd).size;
             const newSize = fs.statSync(tempFilename).size;
             this.log(`${LOG_INFO_PREFIX} Vacuumed database: ${oldSize} bytes -> ${newSize} bytes`);
 
-            // Replace the original file with the compacted temporary file
             fs.renameSync(tempFilename, this.filename);
 
-            // Update in-memory
-            this.header = newHeader;
+            this.header = Buffer.from(newHeader);
             this.index = newIndex;
             this.dataTail = newDataOffset;
-
         } finally {
+            if (tempFd !== null) {
+                fs.closeSync(tempFd);
+            }
+            if (fs.existsSync(tempFilename)) {
+                fs.unlinkSync(tempFilename);
+            }
             this.unlock(fd);
             fs.closeSync(fd);
         }
