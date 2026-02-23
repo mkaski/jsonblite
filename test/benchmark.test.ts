@@ -1,4 +1,4 @@
-import JSONBLite from '../src/jsonblite.js';
+import JSONBLite from '../src/jsonblite.ts';
 import { promises as fs } from 'fs';
 
 const NUM_OPERATIONS = 10_000;

@@ -1,4 +1,4 @@
-import JSONBLite from '../src/jsonblite.js';
+import JSONBLite from '../src/jsonblite.ts';
 
 const path = './data/example.jsonblite';
 

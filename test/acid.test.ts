@@ -1,6 +1,6 @@
 import fs from 'fs';
 import assert from 'assert';
-import Jsonblite from '../src/jsonblite.js';
+import Jsonblite from '../src/jsonblite.ts';
 
 const DB_FILE = './data/acid.jsonblite';
 

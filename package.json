@@ -7,17 +7,18 @@
   "type": "module",
   "scripts": {
     "build": "tsc",
-    "test": "tsc && node dist/test/jsonblite.test.js && node dist/test/acid.test.js",
-    "benchmark": "tsc && node dist/test/benchmark.test.js"
+    "typecheck": "tsc --noEmit",
+    "test": "node --experimental-strip-types test/jsonblite.test.ts && node --experimental-strip-types test/acid.test.ts",
+    "benchmark": "node --experimental-strip-types test/benchmark.test.ts"
   },
   "dependencies": {
     "cbor-x": "^1.6.0",
-    "fs-ext": "^2.0.0"
+    "fs-ext": "^2.1.1"
   },
   "devDependencies": {
     "@types/fs-ext": "^2.0.3",
-    "@types/node": "^20.14.10",
-    "typescript": "^5.5.3"
+    "@types/node": "^25.3.0",
+    "typescript": "^5.9.3"
   },
   "files": [
     "dist",

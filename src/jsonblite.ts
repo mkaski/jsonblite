@@ -18,7 +18,7 @@ import {
     LOG_ERROR_PREFIX,
     LOG_INFO_PREFIX,
     LOG_PREFIX,
-} from './constants.js';
+} from './constants.ts';
 
 interface Options {
     verbose?: boolean;
